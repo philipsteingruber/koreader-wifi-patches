@@ -1,14 +1,32 @@
 -- Fixes the silent restore-on-resume only ever retrying the ONE Wi-Fi
--- network Kobo's own picker left "enabled" in wpa_supplicant.conf, instead
+-- network the Kobo FIRMWARE left "enabled" in wpa_supplicant.conf, instead
 -- of falling back to any of your other saved networks.
 --
--- Background: every time you pick a network via KOReader's own Wi-Fi menu,
--- it disables every OTHER saved network in wpa_supplicant.conf, leaving only
--- the one you picked enabled. That's fine for a manual, in-range pick, but
--- the async silent restore-on-resume (NetworkMgr:restoreWifiAsync(), just
--- `os.execute("./restore-wifi-async.sh")`) starts a brand-new
--- wpa_supplicant process on every resume, which reads that SAME file and so
--- only ever has that one network to try. If you've moved to a different
+-- CORRECTION (2026-08-30): an earlier version of this comment claimed that
+-- KOReader's own Wi-Fi menu is what disables the other saved networks. That
+-- is wrong -- KOReader never writes this file at all. Corrected below. The
+-- conclusion (the restore only ever has one candidate) is unchanged; only
+-- the mechanism was misattributed.
+--
+-- Background: KOReader never writes wpa_supplicant.conf. It configures
+-- networks at RUNTIME only -- ADD_NETWORK / SET_NETWORK / ENABLE_NETWORK via
+-- lj-wpaclient, from WpaSupplicant:authenticateNetwork -- and there is no
+-- SAVE_CONFIG call anywhere in the KOReader tree, so none of that is ever
+-- persisted. DISABLE_NETWORK likewise has zero call sites. The `disabled=1`
+-- lines in this file are written by the Kobo firmware (nickel), not by
+-- KOReader. (Verified 2026-08-30 by code search against koreader/koreader:
+-- the only reference to wpa_supplicant.conf in the whole repo is
+-- platform/kobo/enable-wifi.sh READING it.)
+--
+-- That distinction is the actual bug: the two connect paths draw on
+-- different sets of networks. The interactive path injects your chosen
+-- network into an ALREADY-RUNNING wpa_supplicant, so it works anywhere. The
+-- async silent restore-on-resume (NetworkMgr:restoreWifiAsync(), just
+-- `os.execute("./restore-wifi-async.sh")`) reaches enable-wifi.sh, which
+-- starts a BRAND-NEW `wpa_supplicant -c /mnt/onboard/.kobo/wpa_supplicant.conf`
+-- on every resume -- so its only candidates are whatever the firmware last
+-- left enabled in that file, regardless of what KOReader itself knows about.
+-- On this device that is exactly one network. If you've moved to a different
 -- known network since (home -> work, or back), the restore
 -- fails after up to 45s, and NetworkMgr responds by turning the radio off
 -- entirely (see `_abortWifiConnection`) -- leaving you fully offline,
@@ -37,8 +55,8 @@
 --     until the very same attempt concludes -- we never try to compute
 --     what the "correct" post-attempt state should be, we just restore the
 --     exact original bytes. This means we never need to know or guess
---     which network "should" end up enabled long-term -- that's still
---     entirely Kobo's own picker's job on your next manual connect.
+--     which network "should" end up enabled long-term -- that stays
+--     entirely the Kobo firmware's business, not ours.
 --   * Writes are temp-file-then-atomic-rename (os.rename on the same
 --     directory/filesystem), so a crash or interruption mid-write can
 --     never leave a half-written config (which holds every saved Wi-Fi
@@ -137,7 +155,7 @@ local function widenNetworks()
         logger.warn("[wifi-widen] Could not read", path, "-- leaving Wi-Fi config untouched")
         return
     end
-    -- Every network Kobo's picker has ever disabled is marked with a
+    -- Every network the Kobo firmware has disabled is marked with a
     -- `disabled=1` line inside its network={} block. Stripping that line
     -- is equivalent to disabled=0 (wpa_supplicant treats a missing
     -- `disabled` key as enabled) and touches nothing else in the file --

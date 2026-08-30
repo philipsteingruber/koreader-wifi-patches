@@ -111,9 +111,13 @@ this patch changes that from *sometimes fatal* to *reliably survivable* — not 
 
 *Fixed by `patches/experimental/2-fix-wifi-restore-single-network.lua`.*
 
-Kobo's network picker disables every *other* saved network in `wpa_supplicant.conf`, leaving
-only the one you chose. The async restore starts a fresh `wpa_supplicant` that reads that
-same file — so it only ever has that one network to try. Move between two known networks
+KOReader never writes `wpa_supplicant.conf` — it configures networks at runtime only
+(`ADD_NETWORK`/`SET_NETWORK`/`ENABLE_NETWORK`, never `SAVE_CONFIG`), so nothing it knows about
+reaches that file. The `disabled=1` lines are the Kobo firmware's, and on this device it leaves
+exactly one network enabled. That splits the two connect paths: the interactive one injects
+your network into a *running* `wpa_supplicant` and works anywhere, while the async restore
+starts a *fresh* `wpa_supplicant` from that firmware-owned file — so it only ever has that one
+network to try, whatever KOReader itself has saved. Move between two known networks
 (home and work, say) and the restore fails after up to 45s, at which point `NetworkMgr` turns
 the radio off entirely and leaves you silently offline until you notice.
 
