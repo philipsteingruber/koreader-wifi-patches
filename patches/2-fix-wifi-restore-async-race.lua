@@ -1,0 +1,87 @@
+-- Root cause of a hard-freeze incident (hard reboot required) observed on one
+-- Kobo on 2026-08-27, confirmed via crash.log timeline analysis. Reported here
+-- as a single-device field observation, not a reproduction across hardware:
+--
+--   08:49:00  Resume -> NetworkListener:onResume -> NetworkMgr:restoreWifiAsync()
+--             (backgrounds ./restore-wifi-async.sh) + scheduleConnectivityCheck()
+--   08:49:07  CWASync:onCloseDocument fires independently, via a plugin's
+--             document-close path (NOT a deliberate user action -- see note below) ->
+--             NetworkMgr:goOnlineToRun -> beforeWifiAction -> turnOnWifiAndWaitForConnection
+--             -> requestToTurnOnWifi -> starts a SECOND, independent interactive
+--             Wi-Fi connection attempt while the async restore is still in flight
+--   08:49:21  restore-wifi-async.sh fails ("Failed to connect to preferred AP!" --
+--             the device had woken on a different Wi-Fi network than the one it
+--             last associated with, so the remembered/preferred AP wasn't in range)
+--   08:49:22  two wpa_supplicant control-socket errors ("Failed to connect to
+--             non-global ctrl_ifname") -- included for timeline completeness
+--             ONLY. This was initially read as the two sequences colliding, but
+--             that reading has since been retracted: the same error also appears
+--             during completely ordinary single-attempt failures, because
+--             disable-wifi.sh runs `wpa_cli terminate` after the control socket
+--             is already gone. It is NOT evidence of the race. The evidence for
+--             that is the source-level pending_connection gap described below,
+--             plus the onCloseDocument stack trace -- both of which stand alone.
+--   ~08:51:30 hard reboot (device never recovered on its own)
+--
+-- Note on the 08:49:07 close: this was NOT someone deliberately closing a
+-- book. The stack trace showed it arriving through a plugin's own
+-- document-close path, triggered incidentally while a book was simply left
+-- open. That matters for how reproducible this is -- the bar is not "close a
+-- book right after waking", it's "have any plugin touch the network within
+-- a few seconds of resume", which is a far more ordinary situation.
+--
+-- NetworkMgr:requestToTurnOnWifi() already has a concurrency guard for exactly
+-- this kind of collision -- self.pending_connection, checked at the top of that
+-- function, returning EBUSY without touching wpa_supplicant if already set (near
+-- the top of NetworkMgr:requestToTurnOnWifi in frontend/ui/network/manager.lua).
+-- But only the interactive path sets it.
+-- NetworkMgr:restoreWifiAsync() (Kobo's async, backgrounded restore-on-resume
+-- implementation, just os.execute("./restore-wifi-async.sh")) never sets it --
+-- making the async restore invisible to that guard. A second, independent
+-- interactive attempt (like CWASync:onCloseDocument's above) sails right past
+-- the EBUSY check and starts fighting the async restore over the same
+-- wpa_supplicant socket.
+--
+-- Fix: make restoreWifiAsync() participate in the same guard. Confirmed safe by
+-- reading the real source (frontend/ui/network/manager.lua and
+-- ui/network/networklistener.lua):
+--   - restoreWifiAsync() has exactly TWO call sites, and BOTH are immediately
+--     followed by scheduleConnectivityCheck() on the very next line:
+--         NetworkListener:onResume()  -- restore-on-resume
+--         NetworkMgr:init()           -- the same restore at app startup
+--     So the polling loop this fix relies on to eventually release the flag
+--     ALWAYS runs, on every path that can set it. (Verified against both
+--     v2026.07.2 and master.) Note the init() site means this wrapper also
+--     fires at KOReader startup, not only on resume.
+--   - connectivityCheck() already unconditionally clears pending_connection on
+--     BOTH outcomes, regardless of who set it: on success, via an explicit
+--     `self.pending_connection = false` right before it returns; on give-up
+--     after 180 iterations (45s), via _abortWifiConnection(), which also clears
+--     it. So this fix doesn't need to invent its own clear path.
+--   - With the flag set, a concurrent interactive attempt
+--     (turnOnWifiAndWaitForConnection -> requestToTurnOnWifi) now correctly
+--     returns EBUSY and backs off (closing its own "Connecting to Wi-Fi..."
+--     widget) instead of calling turnOnWifi() a second time and colliding with
+--     the in-flight async restore.
+--
+-- NetworkMgr is a plain require()-able singleton (not a per-instance
+-- dofile()'d plugin), so this uses the same reliable monkey-patch pattern as
+-- 2-fix-wifi-auto-restore.lua.
+--
+-- LOAD ORDER / PAIRING: 2-fix-wifi-restore-single-network.lua wraps this SAME
+-- function. Patches load in alphanumeric filename order, so this file loads
+-- first and that one ends up the OUTER wrapper: its config widen runs, then
+-- this sets pending_connection, then the original fires. That order is
+-- correct and intentional -- don't rename either file.
+--
+-- If you install only ONE of the two, install THIS one. Running the widen
+-- patch without this guard means config rewriting with no concurrency
+-- protection -- exactly the collision described above.
+
+local NetworkMgr = require("ui/network/manager")
+
+local orig_restoreWifiAsync = NetworkMgr.restoreWifiAsync
+NetworkMgr.restoreWifiAsync = function(self, ...)
+    self.pending_connection = true
+    return orig_restoreWifiAsync(self, ...)
+end
